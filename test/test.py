@@ -1,40 +1,281 @@
-# SPDX-FileCopyrightText: © 2024 Tiny Tapeout
-# SPDX-License-Identifier: Apache-2.0
+import os
+import random
+from pathlib import Path
 
 import cocotb
+import lz4.block
 from cocotb.clock import Clock
-from cocotb.triggers import ClockCycles
+from cocotb.triggers import ClockCycles, Timer
+from cocotb.utils import get_sim_time
+
+import golden
+
+
+GATES = os.environ.get("GATES") == "yes"
+CLOCK_PERIOD_NS = 20
+HASH_BASE = 0x020000
+
+
+def initial_byte(address):
+    return (
+        (address * 73)
+        ^ (address >> 7)
+        ^ (address >> 11)
+        ^ ((address >> 3) * 29)
+        ^ 0x5A
+    ) & 0xFF
+
+
+def load_hash_table_from_model(dut):
+    memory = dut.psram_model.mem
+    table = [0] * 65536
+    for index in range(65536):
+        address = HASH_BASE + 2 * index
+        low = int(memory[address].value)
+        high = int(memory[address + 1].value)
+        assert low == initial_byte(address)
+        assert high == initial_byte(address + 1)
+        table[index] = low | (high << 8)
+    return table
+
+
+def gpio_status(dut):
+    pins = int(dut.uo_out.value)
+    return (
+        0xA0
+        | (((pins >> 4) & 1) << 3)
+        | (((pins >> 3) & 1) << 2)
+        | (((pins >> 2) & 1) << 1)
+        | ((pins >> 1) & 1)
+    )
+
+
+async def reset_design(dut, rd_late, delay_ns, powerup_delay=False):
+    dut.psram_model.read_delay_ns.value = delay_ns
+    dut.ui_in.value = (rd_late << 3) | 0x04
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    if powerup_delay:
+        await ClockCycles(dut.clk, 7490)
+    dut.rst_n.value = 1
+    await ClockCycles(dut.clk, 40)
+    assert (int(dut.uio_out.value) & 0x81) == 0x81
+    assert int(dut.psram_error_count.value) == 0
+
+
+async def spi_transaction(dut, command=0, data=0, rd_late=1):
+    ui_base = rd_late << 3
+    dut.ui_in.value = ui_base | 0x04
+    await ClockCycles(dut.clk, 4)
+    dut.ui_in.value = ui_base
+    await ClockCycles(dut.clk, 4)
+
+    received = []
+    for outgoing in (command, data):
+        incoming = 0
+        for bit in range(7, -1, -1):
+            value = (outgoing >> bit) & 1
+            dut.ui_in.value = ui_base | (value << 1)
+            await ClockCycles(dut.clk, 1)
+            dut.ui_in.value = ui_base | 0x01 | (value << 1)
+            await ClockCycles(dut.clk, 4)
+            incoming = (incoming << 1) | (int(dut.uo_out.value) & 1)
+            dut.ui_in.value = ui_base | (value << 1)
+            await ClockCycles(dut.clk, 4)
+        received.append(incoming)
+
+    dut.ui_in.value = ui_base | 0x04
+    await ClockCycles(dut.clk, 4)
+    assert (received[0] & 0xF0) == 0xA0
+    return received[0], received[1]
+
+
+async def run_job(dut, payload, mode, rd_late, poll_status=True, expect_error=False):
+    payload = bytes(payload)
+    output = bytearray()
+    index = 0
+    ended = False
+    error_seen = False
+    start_ns = int(get_sim_time(unit="ns"))
+
+    await spi_transaction(dut, 0x80 | (mode << 6), 0, rd_late)
+    rounds = 0
+    while rounds < 200000:
+        rounds += 1
+        if poll_status:
+            status, _ = await spi_transaction(dut, 0, 0, rd_late)
+        else:
+            await ClockCycles(dut.clk, 1)
+            status = gpio_status(dut)
+
+        if status & 0x08:
+            error_seen = True
+
+        if status & 0x02:
+            _, result_byte = await spi_transaction(dut, 0x02, 0, rd_late)
+            output.append(result_byte)
+        elif index < len(payload) and (status & 0x01):
+            command = 0x01
+            if index == len(payload) - 1:
+                command |= 0x04
+                ended = True
+            await spi_transaction(dut, command, payload[index], rd_late)
+            index += 1
+        elif index == len(payload) and not ended and (status & 0x01):
+            await spi_transaction(dut, 0x04, 0, rd_late)
+            ended = True
+        elif status & 0x04:
+            break
+        else:
+            await ClockCycles(dut.clk, 1)
+    else:
+        raise AssertionError("LZ4 job timed out")
+
+    elapsed_cycles = (
+        int(get_sim_time(unit="ns")) - start_ns
+    ) // CLOCK_PERIOD_NS
+    assert error_seen == expect_error
+    assert int(dut.psram_error_count.value) == 0
+    assert (int(dut.uio_out.value) & 0x81) == 0x81
+    return bytes(output), elapsed_cycles
+
+
+def overlapping_block(offset, seed, match_length=300):
+    encoded = bytearray([(len(seed) << 4) | 0x0F])
+    encoded.extend(seed)
+    encoded.extend((offset, 0))
+    remaining = match_length - 19
+    while remaining >= 255:
+        encoded.append(255)
+        remaining -= 255
+    encoded.append(remaining)
+    encoded.append(0x50)
+    encoded.extend(b"12345")
+    expected = bytearray(seed)
+    for _ in range(match_length):
+        expected.append(expected[-offset])
+    expected.extend(b"12345")
+    return bytes(encoded), bytes(expected)
 
 
 @cocotb.test()
-async def test_project(dut):
-    dut._log.info("Start")
+async def codec_test(dut):
+    cocotb.start_soon(Clock(dut.clk, CLOCK_PERIOD_NS, unit="ns").start())
+    await Timer(1, unit="ns")
 
-    # Set the clock period to 10 us (100 KHz)
-    clock = Clock(dut.clk, 10, unit="us")
-    cocotb.start_soon(clock.start())
+    await reset_design(dut, rd_late=1, delay_ns=18, powerup_delay=True)
+    hash_table = load_hash_table_from_model(dut)
 
-    # Reset
-    dut._log.info("Reset")
-    dut.ena.value = 1
-    dut.ui_in.value = 0
-    dut.uio_in.value = 0
-    dut.rst_n.value = 0
-    await ClockCycles(dut.clk, 10)
-    dut.rst_n.value = 1
+    rng = random.Random(0x4C5A34)
+    license_path = Path(__file__).resolve().parents[1] / "LICENSE"
+    license_text = license_path.read_bytes() if license_path.exists() else (
+        b"Copyright 2026. This implementation is licensed under Apache-2.0. "
+    )
+    text_data = (license_text * 2)[:2048]
+    random_data = bytes(rng.randrange(256) for _ in range(2300))
+    long_prefix = bytes(rng.randrange(256) for _ in range(320))
+    long_data = long_prefix + (b"XYZ" * 220)
+    repeat_data = b"ab" * 512
 
-    dut._log.info("Test project behavior")
+    if GATES:
+        compress_cases = [b"", b"gate-level LZ4 test " * 8]
+    else:
+        compress_cases = (
+            [b""] + [bytes([value]) * value for value in range(1, 21)]
+            + [bytes(256), random_data, repeat_data, text_data, long_data]
+        )
 
-    # Set the input values you want to test
-    dut.ui_in.value = 20
-    dut.uio_in.value = 30
+    compressed_outputs = []
+    throughput = {}
+    for data in compress_cases:
+        expected = golden.compress(data, hash_table)
+        actual, cycles = await run_job(
+            dut, data, mode=0, rd_late=1, poll_status=True
+        )
+        assert actual == expected, (
+            f"compress mismatch for {len(data)} input bytes: "
+            f"{actual[:32].hex()} != {expected[:32].hex()}"
+        )
+        assert lz4.block.decompress(
+            actual, uncompressed_size=len(data)
+        ) == data
+        compressed_outputs.append((data, actual))
+        if data is text_data or data is random_data:
+            throughput["text" if data is text_data else "random"] = (
+                cycles / len(data)
+            )
 
-    # Wait for one clock cycle to see the output values
-    await ClockCycles(dut.clk, 1)
+    if "text" in throughput:
+        dut._log.info("compress cycles/input byte: text %.2f", throughput["text"])
+    if "random" in throughput:
+        dut._log.info(
+            "compress cycles/input byte: random %.2f", throughput["random"]
+        )
 
-    # The following assersion is just an example of how to check the output values.
-    # Change it to match the actual expected output of your module:
-    assert dut.uo_out.value == 50
+    await reset_design(dut, rd_late=0, delay_ns=3)
+    if GATES:
+        decompress_cases = [
+            (b"small gate decompress " * 8, "default"),
+            (compress_cases[-1], "hardware"),
+        ]
+    else:
+        decompress_cases = [
+            (text_data[:512], "default"),
+            (random_data[:256], "high"),
+            (compressed_outputs[-2][0], "hardware"),
+        ]
 
-    # Keep testing the module by changing the input values, waiting for
-    # one or more clock cycles, and asserting the expected output values.
+    decompress_cycles = None
+    for data, source in decompress_cases:
+        if source == "hardware":
+            compressed = next(
+                encoded for original, encoded in compressed_outputs
+                if original == data
+            )
+        elif source == "high":
+            compressed = lz4.block.compress(
+                data,
+                mode="high_compression",
+                compression=12,
+                store_size=False,
+            )
+        else:
+            compressed = lz4.block.compress(data, store_size=False)
+        actual, cycles = await run_job(
+            dut, compressed, mode=1, rd_late=0, poll_status=True
+        )
+        assert actual == data
+        if decompress_cycles is None:
+            decompress_cycles = cycles / len(compressed)
+
+    dut._log.info(
+        "decompress cycles/input byte: %.2f", decompress_cycles or 0.0
+    )
+
+    if not GATES:
+        for offset, seed in ((1, b"A"), (2, b"AB"), (3, b"ABC")):
+            encoded, expected = overlapping_block(offset, seed)
+            actual, _ = await run_job(
+                dut, encoded, mode=1, rd_late=0, poll_status=False
+            )
+            assert actual == expected
+
+        for malformed in (b"\x10A\x00\x00", b"\x10A\x02\x00"):
+            actual, _ = await run_job(
+                dut,
+                malformed,
+                mode=1,
+                rd_late=0,
+                poll_status=False,
+                expect_error=True,
+            )
+            assert actual == b"A"
+
+        interleave_data = b"interleave-" * 64
+        expected = golden.compress(interleave_data, hash_table)
+        actual, _ = await run_job(
+            dut, interleave_data, mode=0, rd_late=0, poll_status=False
+        )
+        assert actual == expected
+
+    assert int(dut.psram_error_count.value) == 0
