@@ -5,8 +5,7 @@ from pathlib import Path
 import cocotb
 import lz4.block
 from cocotb.clock import Clock
-from cocotb.triggers import ClockCycles, Timer
-from cocotb.utils import get_sim_time
+from cocotb.triggers import ClockCycles, ReadOnly, RisingEdge, Timer
 
 import golden
 
@@ -61,6 +60,26 @@ async def reset_design(dut, rd_late, delay_ns, powerup_delay=False):
     assert (int(dut.uio_out.value) & 0x81) == 0x81
 
 
+async def count_engine_blocked_cycles(dut, cycles):
+    while True:
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        flags = tuple(
+            str(dut.uo_out[index].value) for index in (1, 2, 3, 4)
+        )
+        if any(flag not in ("0", "1") for flag in flags):
+            continue
+        in_ready, out_valid, done, error = (int(flag) for flag in flags)
+        if (
+            int(dut.user_project.engine.started.value)
+            and not in_ready
+            and not out_valid
+            and not done
+            and not error
+        ):
+            cycles[0] += 1
+
+
 async def spi_transaction(dut, command=0, data=0, rd_late=1):
     ui_base = rd_late << 3
     dut.ui_in.value = ui_base | 0x04
@@ -94,7 +113,10 @@ async def run_job(dut, payload, mode, rd_late, poll_status=True, expect_error=Fa
     index = 0
     ended = False
     error_seen = False
-    start_ns = int(get_sim_time(unit="ns"))
+    engine_blocked_cycles = [0]
+    monitor = cocotb.start_soon(
+        count_engine_blocked_cycles(dut, engine_blocked_cycles)
+    )
 
     await spi_transaction(dut, 0x80 | (mode << 6), 0, rd_late)
     rounds = 0
@@ -151,9 +173,7 @@ async def run_job(dut, payload, mode, rd_late, poll_status=True, expect_error=Fa
             f"byte_done={int(dut.user_project.ps_bdone.value)}"
         )
 
-    elapsed_cycles = (
-        int(get_sim_time(unit="ns")) - start_ns
-    ) // CLOCK_PERIOD_NS
+    monitor.cancel()
     assert error_seen == expect_error, (
         f"unexpected error={error_seen}, state={int(dut.user_project.engine.state.value)}, "
         f"p={int(dut.user_project.engine.p.value)}, "
@@ -163,7 +183,7 @@ async def run_job(dut, payload, mode, rd_late, poll_status=True, expect_error=Fa
         f"input={index}/{len(payload)}, output={len(output)}"
     )
     assert (int(dut.uio_out.value) & 0x81) == 0x81
-    return bytes(output), elapsed_cycles
+    return bytes(output), engine_blocked_cycles[0]
 
 
 def overlapping_block(offset, seed, match_length=300):
@@ -212,10 +232,10 @@ async def codec_test(dut):
         )
 
     compressed_outputs = []
-    throughput = {}
+    engine_cycles_per_byte = {}
     for data in compress_cases:
         expected = golden.compress(data, hash_table)
-        actual, cycles = await run_job(
+        actual, blocked_cycles = await run_job(
             dut, data, mode=0, rd_late=RD_LATE, poll_status=True
         )
         assert actual == expected, (
@@ -227,15 +247,21 @@ async def codec_test(dut):
         ) == data
         compressed_outputs.append((data, actual))
         if data is text_data or data is random_data:
-            throughput["text" if data is text_data else "random"] = (
-                cycles / len(data)
+            engine_cycles_per_byte[
+                "text" if data is text_data else "random"
+            ] = (
+                blocked_cycles / len(data)
             )
 
-    if "text" in throughput:
-        dut._log.info("compress cycles/input byte: text %.2f", throughput["text"])
-    if "random" in throughput:
+    if "text" in engine_cycles_per_byte:
         dut._log.info(
-            "compress cycles/input byte: random %.2f", throughput["random"]
+            "compress engine-blocked cycles/input byte: text %.2f",
+            engine_cycles_per_byte["text"],
+        )
+    if "random" in engine_cycles_per_byte:
+        dut._log.info(
+            "compress engine-blocked cycles/input byte: random %.2f",
+            engine_cycles_per_byte["random"],
         )
 
     await reset_design(dut, rd_late=RD_LATE, delay_ns=3)
@@ -251,7 +277,7 @@ async def codec_test(dut):
             (compressed_outputs[-2][0], "hardware"),
         ]
 
-    decompress_cycles = None
+    decompress_engine_cycles_per_byte = None
     for data, source in decompress_cases:
         if source == "hardware":
             compressed = next(
@@ -267,15 +293,16 @@ async def codec_test(dut):
             )
         else:
             compressed = lz4.block.compress(data, store_size=False)
-        actual, cycles = await run_job(
+        actual, blocked_cycles = await run_job(
             dut, compressed, mode=1, rd_late=RD_LATE, poll_status=True
         )
         assert actual == data
-        if decompress_cycles is None:
-            decompress_cycles = cycles / len(compressed)
+        if decompress_engine_cycles_per_byte is None:
+            decompress_engine_cycles_per_byte = blocked_cycles / len(compressed)
 
     dut._log.info(
-        "decompress cycles/input byte: %.2f", decompress_cycles or 0.0
+        "decompress engine-blocked cycles/input byte: %.2f",
+        decompress_engine_cycles_per_byte or 0.0,
     )
 
     if not GATES:
