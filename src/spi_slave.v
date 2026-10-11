@@ -10,14 +10,13 @@ module spi_slave (
     input  wire [7:0] out_byte,
     input  wire       psram_ready,
     output wire       miso,
-    output reg        start,
-    output reg        mode,
-    output reg        push,
-    output reg  [7:0] push_data,
-    output reg        end_job,
-    output reg        pop
+    output wire       start,
+    output wire       mode,
+    output wire       push,
+    output wire [7:0] push_data,
+    output wire       end_job,
+    output wire       pop
 );
-
     reg sck_meta;
     reg sck_sync;
     reg sck_prev;
@@ -26,20 +25,24 @@ module spi_slave (
     reg cs_meta;
     reg cs_sync;
     reg cs_prev;
-    reg [4:0] bit_count;
-    reg [7:0] command_shift;
-    reg [6:0] data_shift;
-    reg [7:0] tx_shift;
-    reg       status_in_ready;
-    reg       status_out_valid;
+    reg [3:0] cnt;
+    reg [7:0] sr;
+    reg [4:0] cmd;
+    reg st_in_ready;
+    reg st_out_valid;
 
     wire sck_rise = sck_sync && !sck_prev;
-    wire sck_fall = !sck_sync && sck_prev;
     wire cs_fall = cs_prev && !cs_sync;
     wire cs_rise = !cs_prev && cs_sync;
-    wire [7:0] received_data = {data_shift, mosi_sync};
+    wire command_edge = !cs_sync && sck_rise && (cnt == 4'hf);
 
-    assign miso = tx_shift[7];
+    assign miso = sr[7];
+    assign mode = cmd[3];
+    assign push_data = {sr[6:0], mosi_sync};
+    assign start = command_edge && cmd[4] && psram_ready;
+    assign push = command_edge && !cmd[4] && cmd[0] && st_in_ready;
+    assign end_job = command_edge && !cmd[4] && cmd[2] && st_in_ready;
+    assign pop = command_edge && !cmd[4] && cmd[1] && st_out_valid;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -51,18 +54,10 @@ module spi_slave (
             cs_meta <= 1'b1;
             cs_sync <= 1'b1;
             cs_prev <= 1'b1;
-            bit_count <= 5'd0;
-            command_shift <= 8'd0;
-            data_shift <= 7'd0;
-            tx_shift <= 8'd0;
-            status_in_ready <= 1'b0;
-            status_out_valid <= 1'b0;
-            start <= 1'b0;
-            mode <= 1'b0;
-            push <= 1'b0;
-            push_data <= 8'd0;
-            end_job <= 1'b0;
-            pop <= 1'b0;
+            cnt <= 4'd0;
+            cmd <= 5'd0;
+            st_in_ready <= 1'b0;
+            st_out_valid <= 1'b0;
         end else begin
             sck_meta <= sck;
             sck_sync <= sck_meta;
@@ -73,62 +68,28 @@ module spi_slave (
             cs_sync <= cs_meta;
             cs_prev <= cs_sync;
 
-            start <= 1'b0;
-            push <= 1'b0;
-            end_job <= 1'b0;
-            pop <= 1'b0;
-
             if (cs_fall) begin
-                bit_count <= 5'd0;
-                command_shift <= 8'd0;
-                data_shift <= 7'd0;
-                tx_shift <= status;
-                status_in_ready <= status[0];
-                status_out_valid <= status[1];
+                cnt <= 4'd0;
+                sr <= status;
+                st_in_ready <= status[0];
+                st_out_valid <= status[1];
             end else if (cs_rise) begin
-                bit_count <= 5'd0;
-                tx_shift <= 8'd0;
-            end else if (!cs_sync) begin
-                if (sck_rise) begin
-                    if (bit_count < 5'd8)
-                        command_shift <= {command_shift[6:0], mosi_sync};
-                    else if (bit_count < 5'd16)
-                        data_shift <= received_data[6:0];
-
-                    if (bit_count == 5'd15) begin
-                        if (command_shift[7]) begin
-                            if (psram_ready) begin
-                                start <= 1'b1;
-                                mode <= command_shift[6];
-                            end
-                        end else begin
-                            if (command_shift[0] && status_in_ready) begin
-                                push <= 1'b1;
-                                push_data <= received_data;
-                            end
-                            if (command_shift[2] && status_in_ready)
-                                end_job <= 1'b1;
-                            if (command_shift[1] && status_out_valid)
-                                pop <= 1'b1;
-                        end
-                    end
-
-                    if (bit_count < 5'd16)
-                        bit_count <= bit_count + 5'd1;
+                cnt <= 4'd0;
+            end else if (!cs_sync && sck_rise) begin
+                if (cnt == 4'd7) begin
+                    cmd <= {sr[6], sr[5], sr[1], sr[0], mosi_sync};
+                    sr <= st_out_valid ? out_byte : 8'd0;
+                end else begin
+                    sr <= {sr[6:0], mosi_sync};
                 end
 
-                if (sck_fall) begin
-                    if (bit_count == 5'd8)
-                        tx_shift <= out_byte;
-                    else if ((bit_count > 5'd0) && (bit_count < 5'd8))
-                        tx_shift <= {tx_shift[6:0], 1'b0};
-                    else if ((bit_count > 5'd8) && (bit_count < 5'd16))
-                        tx_shift <= {tx_shift[6:0], 1'b0};
-                end
+                if (cnt == 4'hf)
+                    cmd <= 5'd0;
+                else
+                    cnt <= cnt + 1'b1;
             end
         end
     end
-
 endmodule
 
 `default_nettype wire

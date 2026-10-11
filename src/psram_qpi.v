@@ -21,6 +21,7 @@ module psram_qpi (
     localparam [3:0] S_INIT=0, S_INIT_F5=1, S_INIT_35_START=2;
     localparam [3:0] S_INIT_35=3, S_IDLE=4, S_CMD=5, S_ADDR=6;
     localparam [3:0] S_DUMMY=7, S_DATA=8, S_GAP=9;
+    localparam [3:0] S_DATA_FALL=10, S_DATA_DECIDE=11;
     reg [3:0] state, phase;
     reg nib;
     reg [1:0] gap;
@@ -166,29 +167,41 @@ module psram_qpi (
                     if (byte_done) begin
                         more_q <= more;
                         page_q <= more && (addr[9:0] == 10'h3ff);
-                    end
-                    if (!psram_sck) begin
+                        if (psram_sck) begin
+                            psram_sck <= 0;
+                            state <= S_DATA_DECIDE;
+                        end else begin
+                            psram_sck <= 1;
+                            state <= S_DATA_FALL;
+                        end
+                    end else if (!psram_sck) begin
                         psram_sck <= 1;
                     end else begin
                         psram_sck <= 0;
                         if (!nib)
                             nib <= 1;
-                        else if (byte_done ? more : more_q) begin
-                            if ((byte_done ? more : more_q) &&
-                                (byte_done ? (addr[9:0] == 10'h3ff) : page_q)) begin
-                                psram_cs_n <= 1;
-                                gap <= 0;
-                                restart_q <= 1;
-                                state <= S_GAP;
-                            end else nib <= 0;
-                        end
-                        else begin
+                    end
+                end
+                S_DATA_FALL: begin
+                    psram_sck <= 0;
+                    state <= S_DATA_DECIDE;
+                end
+                S_DATA_DECIDE: begin
+                    if (more_q) begin
+                        if (page_q) begin
                             psram_cs_n <= 1;
-                            psram_sck <= 0;
                             gap <= 0;
-                            restart_q <= 0;
+                            restart_q <= 1;
                             state <= S_GAP;
+                        end else begin
+                            nib <= 0;
+                            state <= S_DATA;
                         end
+                    end else begin
+                        psram_cs_n <= 1;
+                        gap <= 0;
+                        restart_q <= 0;
+                        state <= S_GAP;
                     end
                 end
                 S_GAP: begin

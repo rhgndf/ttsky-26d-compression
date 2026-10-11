@@ -21,15 +21,16 @@ def initial_byte(address):
     return address & 0xFF
 
 
-def load_hash_table_from_model(dut):
+def load_hash_table_from_model(dut, check_initial=True):
     memory = dut.psram_model.mem
     table = [0] * 65536
     for index in range(65536):
         address = HASH_BASE + 2 * index
         byte0 = int(memory[address].value)
         byte1 = int(memory[address + 1].value)
-        assert byte0 == initial_byte(address)
-        assert byte1 == initial_byte(address + 1)
+        if check_initial:
+            assert byte0 == initial_byte(address)
+            assert byte1 == initial_byte(address + 1)
         n0 = (byte0 >> 4) & 0xF
         n1 = byte0 & 0xF
         n2 = (byte1 >> 4) & 0xF
@@ -74,9 +75,9 @@ async def spi_transaction(dut, command=0, data=0, rd_late=1):
             value = (outgoing >> bit) & 1
             dut.ui_in.value = ui_base | (value << 1)
             await ClockCycles(dut.clk, 1)
+            incoming = (incoming << 1) | (int(dut.uo_out.value) & 1)
             dut.ui_in.value = ui_base | 0x01 | (value << 1)
             await ClockCycles(dut.clk, 4)
-            incoming = (incoming << 1) | (int(dut.uo_out.value) & 1)
             dut.ui_in.value = ui_base | (value << 1)
             await ClockCycles(dut.clk, 4)
         received.append(incoming)
@@ -97,7 +98,7 @@ async def run_job(dut, payload, mode, rd_late, poll_status=True, expect_error=Fa
 
     await spi_transaction(dut, 0x80 | (mode << 6), 0, rd_late)
     rounds = 0
-    while rounds < 200000:
+    while rounds < int(os.environ.get("JOB_ROUND_LIMIT", "200000")):
         rounds += 1
         if poll_status:
             status, _ = await spi_transaction(dut, 0, 0, rd_late)
@@ -134,15 +135,33 @@ async def run_job(dut, payload, mode, rd_late, poll_status=True, expect_error=Fa
             f"ps_busy={int(dut.user_project.psram_busy.value)}, "
             f"psram_sck={int(dut.user_project.psram_sck.value)}, "
             f"psram_cs_n={int(dut.user_project.psram_cs_n.value)}, "
-            f"op_kind={int(dut.user_project.engine.op_kind.value)}, "
-            f"op_index={int(dut.user_project.engine.op_index.value)}, "
+            f"w={int(dut.user_project.engine.w.value)}, "
+            f"p={int(dut.user_project.engine.p.value)}, "
+            f"q={int(dut.user_project.engine.q.value)}, "
+            f"ptr={int(dut.user_project.engine.ptr.value)}, "
+            f"cur=0x{int(dut.user_project.engine.cur.value):08x}, "
+            f"in_full={int(dut.user_project.engine.in_full.value)}, "
+            f"end_flag={int(dut.user_project.engine.end_flag.value)}, "
+            f"started={int(dut.user_project.engine.started.value)}, "
+            f"error={int(dut.user_project.engine.error.value)}, "
+            f"in_ready={int(dut.user_project.in_ready.value)}, "
+            f"spi_snapshot={int(dut.user_project.spi.st_in_ready.value)}, "
+            f"spi_sr=0x{int(dut.user_project.spi.sr.value):02x}, "
+            f"status=0x{int(dut.user_project.status.value):02x}, "
             f"byte_done={int(dut.user_project.ps_bdone.value)}"
         )
 
     elapsed_cycles = (
         int(get_sim_time(unit="ns")) - start_ns
     ) // CLOCK_PERIOD_NS
-    assert error_seen == expect_error
+    assert error_seen == expect_error, (
+        f"unexpected error={error_seen}, state={int(dut.user_project.engine.state.value)}, "
+        f"p={int(dut.user_project.engine.p.value)}, "
+        f"q={int(dut.user_project.engine.q.value)}, "
+        f"e=0x{int(dut.user_project.engine.e.value):04x}, "
+        f"cur=0x{int(dut.user_project.engine.cur.value):08x}, "
+        f"input={index}/{len(payload)}, output={len(output)}"
+    )
     assert (int(dut.uio_out.value) & 0x81) == 0x81
     return bytes(output), elapsed_cycles
 
@@ -284,3 +303,20 @@ async def codec_test(dut):
             dut, interleave_data, mode=0, rd_late=RD_LATE, poll_status=False
         )
         assert actual == expected
+
+
+@cocotb.test()
+async def quick_smoke_test(dut):
+    cocotb.start_soon(Clock(dut.clk, CLOCK_PERIOD_NS, unit="ns").start())
+    await Timer(1, unit="ns")
+    await reset_design(dut, rd_late=RD_LATE, delay_ns=18, powerup_delay=True)
+    hash_table = load_hash_table_from_model(dut, check_initial=False)
+
+    payload = b"single-register SPI smoke test"
+    expected = golden.compress(payload, hash_table)
+    actual, _ = await run_job(dut, payload, mode=0, rd_late=RD_LATE)
+    assert actual == expected
+
+    encoded = lz4.block.compress(payload, store_size=False)
+    actual, _ = await run_job(dut, encoded, mode=1, rd_late=RD_LATE)
+    assert actual == payload
