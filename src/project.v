@@ -28,12 +28,12 @@ module tt_um_rhgndf_lz4 (
     wire ps_start;
     wire ps_we;
     wire [17:0] ps_addr;
-    wire [7:0] ps_wdata;
     wire ps_more;
     wire psram_ready;
     wire psram_busy;
     wire ps_bdone;
-    wire [7:0] ps_rdata;
+    wire [3:0] ps_wnib;
+    wire ps_nstrobe;
     wire [3:0] sd_in;
     wire [3:0] sd_out;
     wire [3:0] sd_oe;
@@ -103,17 +103,16 @@ module tt_um_rhgndf_lz4 (
         .start(ps_start),
         .we(ps_we),
         .addr(ps_addr),
-        .wdata(ps_wdata),
         .more(ps_more),
-        .sd_in(sd_in),
+        .wnib(ps_wnib),
         .psram_sck(psram_sck),
         .psram_cs_n(psram_cs_n),
         .sd_out(sd_out),
         .sd_oe(sd_oe),
         .ready(psram_ready),
         .busy(psram_busy),
-        .bdone(ps_bdone),
-        .rdata(ps_rdata)
+        .byte_done(ps_bdone),
+        .nib_strobe(ps_nstrobe)
     );
 
     lz4_engine engine (
@@ -128,11 +127,12 @@ module tt_um_rhgndf_lz4 (
         .psram_ready(psram_ready),
         .psram_busy(psram_busy),
         .ps_bdone(ps_bdone),
-        .ps_rdata(ps_rdata),
+        .ps_nstrobe(ps_nstrobe),
+        .ps_sd_in(sd_in),
         .ps_start(ps_start),
         .ps_we(ps_we),
         .ps_addr(ps_addr),
-        .ps_wdata(ps_wdata),
+        .ps_wnib(ps_wnib),
         .ps_more(ps_more),
         .in_ready(in_ready),
         .out_valid(out_valid),

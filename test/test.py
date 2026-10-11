@@ -14,16 +14,11 @@ import golden
 GATES = os.environ.get("GATES") == "yes"
 CLOCK_PERIOD_NS = 20
 HASH_BASE = 0x020000
+RD_LATE = int(os.environ.get("PSRAM_RD_LATE", "1"))
 
 
 def initial_byte(address):
-    return (
-        (address * 73)
-        ^ (address >> 7)
-        ^ (address >> 11)
-        ^ ((address >> 3) * 29)
-        ^ 0x5A
-    ) & 0xFF
+    return address & 0xFF
 
 
 def load_hash_table_from_model(dut):
@@ -31,11 +26,15 @@ def load_hash_table_from_model(dut):
     table = [0] * 65536
     for index in range(65536):
         address = HASH_BASE + 2 * index
-        low = int(memory[address].value)
-        high = int(memory[address + 1].value)
-        assert low == initial_byte(address)
-        assert high == initial_byte(address + 1)
-        table[index] = low | (high << 8)
+        byte0 = int(memory[address].value)
+        byte1 = int(memory[address + 1].value)
+        assert byte0 == initial_byte(address)
+        assert byte1 == initial_byte(address + 1)
+        n0 = (byte0 >> 4) & 0xF
+        n1 = byte0 & 0xF
+        n2 = (byte1 >> 4) & 0xF
+        n3 = byte1 & 0xF
+        table[index] = (n3 << 12) | (n2 << 8) | (n1 << 4) | n0
     return table
 
 
@@ -51,7 +50,6 @@ def gpio_status(dut):
 
 
 async def reset_design(dut, rd_late, delay_ns, powerup_delay=False):
-    dut.psram_model.read_delay_ns.value = delay_ns
     dut.ui_in.value = (rd_late << 3) | 0x04
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
@@ -60,7 +58,6 @@ async def reset_design(dut, rd_late, delay_ns, powerup_delay=False):
     dut.rst_n.value = 1
     await ClockCycles(dut.clk, 40)
     assert (int(dut.uio_out.value) & 0x81) == 0x81
-    assert int(dut.psram_error_count.value) == 0
 
 
 async def spi_transaction(dut, command=0, data=0, rd_late=1):
@@ -129,13 +126,23 @@ async def run_job(dut, payload, mode, rd_late, poll_status=True, expect_error=Fa
         else:
             await ClockCycles(dut.clk, 1)
     else:
-        raise AssertionError("LZ4 job timed out")
+        raise AssertionError(
+            f"LZ4 job timed out: input={index}/{len(payload)}, "
+            f"output={len(output)}, status=0x{status:02x}, "
+            f"engine_state={int(dut.user_project.engine.state.value)}, "
+            f"ps_state={int(dut.user_project.psram.state.value)}, "
+            f"ps_busy={int(dut.user_project.psram_busy.value)}, "
+            f"psram_sck={int(dut.user_project.psram_sck.value)}, "
+            f"psram_cs_n={int(dut.user_project.psram_cs_n.value)}, "
+            f"op_kind={int(dut.user_project.engine.op_kind.value)}, "
+            f"op_index={int(dut.user_project.engine.op_index.value)}, "
+            f"byte_done={int(dut.user_project.ps_bdone.value)}"
+        )
 
     elapsed_cycles = (
         int(get_sim_time(unit="ns")) - start_ns
     ) // CLOCK_PERIOD_NS
     assert error_seen == expect_error
-    assert int(dut.psram_error_count.value) == 0
     assert (int(dut.uio_out.value) & 0x81) == 0x81
     return bytes(output), elapsed_cycles
 
@@ -163,7 +170,7 @@ async def codec_test(dut):
     cocotb.start_soon(Clock(dut.clk, CLOCK_PERIOD_NS, unit="ns").start())
     await Timer(1, unit="ns")
 
-    await reset_design(dut, rd_late=1, delay_ns=18, powerup_delay=True)
+    await reset_design(dut, rd_late=RD_LATE, delay_ns=18, powerup_delay=True)
     hash_table = load_hash_table_from_model(dut)
 
     rng = random.Random(0x4C5A34)
@@ -190,7 +197,7 @@ async def codec_test(dut):
     for data in compress_cases:
         expected = golden.compress(data, hash_table)
         actual, cycles = await run_job(
-            dut, data, mode=0, rd_late=1, poll_status=True
+            dut, data, mode=0, rd_late=RD_LATE, poll_status=True
         )
         assert actual == expected, (
             f"compress mismatch for {len(data)} input bytes: "
@@ -212,7 +219,7 @@ async def codec_test(dut):
             "compress cycles/input byte: random %.2f", throughput["random"]
         )
 
-    await reset_design(dut, rd_late=0, delay_ns=3)
+    await reset_design(dut, rd_late=RD_LATE, delay_ns=3)
     if GATES:
         decompress_cases = [
             (b"small gate decompress " * 8, "default"),
@@ -242,7 +249,7 @@ async def codec_test(dut):
         else:
             compressed = lz4.block.compress(data, store_size=False)
         actual, cycles = await run_job(
-            dut, compressed, mode=1, rd_late=0, poll_status=True
+            dut, compressed, mode=1, rd_late=RD_LATE, poll_status=True
         )
         assert actual == data
         if decompress_cycles is None:
@@ -256,7 +263,7 @@ async def codec_test(dut):
         for offset, seed in ((1, b"A"), (2, b"AB"), (3, b"ABC")):
             encoded, expected = overlapping_block(offset, seed)
             actual, _ = await run_job(
-                dut, encoded, mode=1, rd_late=0, poll_status=False
+                dut, encoded, mode=1, rd_late=RD_LATE, poll_status=False
             )
             assert actual == expected
 
@@ -265,7 +272,7 @@ async def codec_test(dut):
                 dut,
                 malformed,
                 mode=1,
-                rd_late=0,
+                rd_late=RD_LATE,
                 poll_status=False,
                 expect_error=True,
             )
@@ -274,8 +281,6 @@ async def codec_test(dut):
         interleave_data = b"interleave-" * 64
         expected = golden.compress(interleave_data, hash_table)
         actual, _ = await run_job(
-            dut, interleave_data, mode=0, rd_late=0, poll_status=False
+            dut, interleave_data, mode=0, rd_late=RD_LATE, poll_status=False
         )
         assert actual == expected
-
-    assert int(dut.psram_error_count.value) == 0

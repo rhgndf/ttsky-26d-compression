@@ -3,7 +3,7 @@ project:
   title:        "LZ4 Block Compressor and Decompressor"
   author:       "rhgndf"
   discord:      ""      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
-  description:  "Streaming LZ4 block codec using APS6404L QPI PSRAM."
+  description:  "Streaming LZ4 block codec using QPI SRAM."
   language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
   clock_hz:     50000000
 

@@ -49,30 +49,29 @@ to `golden.compress(data, table)` where `table` is the PSRAM hash-table contents
   out_valid only by its own POP, so the live GPIOs uo1/uo2 are also safe for the host to poll).
 
 ## PSRAM (APS6404L, QPI) controller
-Ground truth for commands: MichaelBell/tinyQV `cpu/qspi_ctrl.v` (silicon-proven on the TT QSPI Pmod):
-QPI read = 0x0B, 6 address nibbles (24-bit, MSB first), 4 dummy SCK cycles, then data;
-QPI write = 0x02, 24-bit address, data. Data byte order: high nibble first.
-- SCK = clk/2 (toggle register). Outputs change when SCK goes low; PSRAM samples on SCK rising.
-- Read sampling: with ui3-latched `rd_late`=0 sample the SD lines in the clk edge where SCK rises;
-  with `rd_late`=1 sample one clk later. (TT mux round-trip is ~20 ns, see tinyQV comments.)
-- uio_oe for SD lines: driven during command/address/write data, released (0) from the start of the
-  dummy cycles of a read until CS_n rises. CS_n high for >= 2 clk between transactions.
-- Init after reset (once): send 0xF5 in QPI (exit QPI: 2 SCK cycles, nibbles F,5 on SD3:0), CS high,
-  then 0x35 in SPI mode (enter QPI: 8 SCK cycles, MSB first on SD0 only, other SD lines driven 1 or
-  released), CS high. Then `ready`=1. (Host guarantees the 150 us PSRAM power-up delay before releasing
-  rst_n.) This makes init work whether the PSRAM was in SPI or QPI mode.
-- The APS6404 wraps bursts at 1 KB page boundaries. The controller must restart the transaction (CS high,
-  new command+address) whenever the address of the next byte crosses into a new 1 KB page.
-- Engine interface (byte stream):
-  - `start` (1-cycle, only when !busy) with `we`, `addr[23:0]`.
-  - `bdone` 1-cycle pulse when a data byte completes; for reads `rdata[7:0]` valid then.
-  - writes: `wdata[7:0]` sampled at the start of each data byte (i.e. engine may update it in the cycle
-    of the previous `bdone`).
-  - `more`: sampled in the `bdone` cycle; 0 ends the transaction after this byte, 1 continues with
-    the next consecutive address. Engine drives `more` combinationally from its state.
-  - `busy` until CS_n has risen and the min CS high time elapsed.
-- Address map: history byte at position pos (16 bit) = {8'h00, pos}; hash entry h (16 bit), 2 bytes
-  little-endian = 24'h020000 + {h, 1'b0}.
+The controller sends QPI command `0xEB` for reads (six dummy SCK cycles) and `0x02` for writes,
+followed by six MSB-first address nibbles. Its 18-bit byte address map is history
+`{2'b00, pos}` and hash entry `{1'b1, h[15:0], 1'b0}`. Data is streamed low nibble first for every
+byte. Since the LY68L6400 model stores the first serial nibble in `mem[addr][7:4]`, the first
+transmitted nibble is the stored byte's high nibble; the engine assembles successive nibbles back
+into the logical byte.
+
+- SCK = clk/2. Outputs change while SCK is low; the PSRAM samples on SCK rising.
+- `ui3` is latched as `rd_late`: 0 samples on the rising edge, 1 samples one `clk` later.
+- SD output-enable is asserted during command/address/write data and released for read dummy/data
+  phases. `nib_strobe` advances the nibble pipe; `byte_done` marks its second nibble.
+- The controller samples `more` at byte completion. At a 1 KB page boundary it raises CS_n, clocks
+  SCK high while CS_n is high, then restarts command/address using the next byte address.
+- After reset, initialization sends QPI command `0xF5` as two nibbles (`F`, `5`), raises CS_n and
+  provides an SCK rising edge, then sends SPI command `0x35` MSB-first on SD0 with SD1-3 undriven.
+  It raises CS_n and provides another SCK rising edge before asserting `ready`. This sequence exits
+  QPI mode and re-enters it for the APS6404L, which powers up in SPI mode. The host must provide the
+  PSRAM power-up delay before releasing reset.
+- The vendored QPI-only LY68L6400 model starts in QPI mode. Its parser is reset on each CS-high SCK
+  rising edge. Both initialization transactions end before its unknown-command handling begins, so
+  they produce no `unknown cmd` output.
+- The controller interface is nibble-oriented: `start`, `we`, `addr[17:0]`, `more`, `wnib[3:0]`,
+  `sd_in[3:0]`, `sd_out[3:0]`, `sd_oe[3:0]`, `nib_strobe`, and `byte_done`.
 
 ## Engine (single module, registers shared between modes)
 Registers (16 bit unless noted): w, p, anchor, q, e (entry/offset), cnt; cur[31:0]; state; flags.
@@ -80,6 +79,10 @@ Output holding register `obyte[7:0]` + `out_valid`; engine only emits when !out_
 Input holding register `ibyte[7:0]` + `in_full`; engine consumes (in_full <= 0).
 Max block size 65535 bytes (input for compress, output for decompress). Each block is independent;
 host issues START per block.
+
+The engine retains an operation-based FSM and registered operation address in this revision.
+`docs/microarch.md` describes the intended shared-ALU/`ptr` rewrite; that architecture is not yet
+fully reflected in `src/lz4_engine.v` or `src/spi_slave.v`.
 
 ### Compress (mode 0)
 Between engine steps, highest priority: if in_full, write ibyte to PSRAM at {8'h00, w}, w <= w+1,

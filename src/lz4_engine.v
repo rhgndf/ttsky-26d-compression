@@ -12,11 +12,12 @@ module lz4_engine (
     input  wire        psram_ready,
     input  wire        psram_busy,
     input  wire        ps_bdone,
-    input  wire [7:0]  ps_rdata,
+    input  wire        ps_nstrobe,
+    input  wire [3:0]  ps_sd_in,
     output wire        ps_start,
     output reg         ps_we,
     output reg  [17:0] ps_addr,
-    output reg  [7:0]  ps_wdata,
+    output wire [3:0]  ps_wnib,
     output wire        ps_more,
     output wire        in_ready,
     output reg         out_valid,
@@ -90,6 +91,8 @@ module lz4_engine (
     reg [2:0]  prefix_len;
     reg        prefix_equal;
     reg [7:0]  write_byte;
+    reg        write_nib;
+    reg [3:0]  read_hi;
     reg [17:0] op_addr;
 
     wire eof = end_flag && !in_full;
@@ -116,17 +119,16 @@ module lz4_engine (
     assign done = (state == S_DONE) && !out_valid;
     assign ps_start = (state == S_PS_ISSUE) && !psram_busy;
     assign ps_more = ({1'b0, op_index} + 4'd1) < {1'b0, op_len};
+    assign ps_wnib = (op_kind == OP_WRITE_TABLE) ?
+                     ((op_index == 0) ?
+                      (write_nib ? p[7:4] : p[3:0]) :
+                      (write_nib ? p[15:12] : p[11:8])) :
+                     (write_nib ? write_byte[7:4] : write_byte[3:0]);
+    wire [7:0] ps_byte = {ps_sd_in, read_hi};
 
     always @* begin
         ps_we = op_mode;
         ps_addr = op_addr;
-        ps_wdata = write_byte;
-        if (op_kind == OP_WRITE_TABLE) begin
-            if (op_index == 3'd0)
-                ps_wdata = p[7:0];
-            else
-                ps_wdata = p[15:8];
-        end
     end
 
     always @(posedge clk or negedge rst_n) begin
@@ -154,6 +156,8 @@ module lz4_engine (
             prefix_len <= 3'd0;
             prefix_equal <= 1'b0;
             write_byte <= 8'd0;
+            write_nib <= 1'b0;
+            read_hi <= 4'd0;
             op_addr <= 18'd0;
             out_valid <= 1'b0;
             error <= 1'b0;
@@ -192,6 +196,12 @@ module lz4_engine (
                 end_flag <= 1'b1;
             if (pop)
                 out_valid <= 1'b0;
+            if (ps_nstrobe) begin
+                if (op_mode)
+                    write_nib <= ~write_nib;
+                else
+                    read_hi <= ps_sd_in;
+            end
 
             case (state)
                 S_WAIT_START: begin
@@ -557,8 +567,10 @@ module lz4_engine (
                 end
 
                 S_PS_ISSUE: begin
-                    if (!psram_busy)
+                    if (!psram_busy) begin
+                        write_nib <= 1'b0;
                         state <= S_PS_WAIT;
+                    end
                 end
 
                 S_PS_WAIT: begin
@@ -566,25 +578,25 @@ module lz4_engine (
                         case (op_kind)
                             OP_READ_CUR: begin
                                 case (op_index)
-                                    3'd0: cur[7:0] <= ps_rdata;
-                                    3'd1: cur[15:8] <= ps_rdata;
-                                    3'd2: cur[23:16] <= ps_rdata;
-                                    default: cur[31:24] <= ps_rdata;
+                                    3'd0: cur[7:0] <= ps_byte;
+                                    3'd1: cur[15:8] <= ps_byte;
+                                    3'd2: cur[23:16] <= ps_byte;
+                                    default: cur[31:24] <= ps_byte;
                                 endcase
                             end
                             OP_READ_TABLE: begin
                                 if (op_index == 3'd0)
-                                    e[7:0] <= ps_rdata;
+                                    e[7:0] <= ps_byte;
                                 else
-                                    e[15:8] <= ps_rdata;
+                                    e[15:8] <= ps_byte;
                             end
                             OP_READ_CAND: begin
-                                if (ps_rdata != cur[7:0])
+                                if (ps_byte != cur[7:0])
                                     match_ok <= 1'b0;
                                 cur <= {8'd0, cur[31:8]};
                             end
                             OP_READ_REF: begin
-                                if (prefix_equal && (ps_rdata == cur[7:0]))
+                                if (prefix_equal && (ps_byte == cur[7:0]))
                                     prefix_len <= prefix_len + 3'd1;
                                 else
                                     prefix_equal <= 1'b0;
@@ -592,20 +604,21 @@ module lz4_engine (
                             end
                             OP_READ_EXT: begin
                                 case (op_index)
-                                    3'd0: cur[7:0] <= ps_rdata;
-                                    3'd1: cur[15:8] <= ps_rdata;
-                                    3'd2: cur[23:16] <= ps_rdata;
-                                    default: cur[31:24] <= ps_rdata;
+                                    3'd0: cur[7:0] <= ps_byte;
+                                    3'd1: cur[15:8] <= ps_byte;
+                                    3'd2: cur[23:16] <= ps_byte;
+                                    default: cur[31:24] <= ps_byte;
                                 endcase
                             end
                             OP_READ_LITERAL, OP_READ_COPY: begin
-                                write_byte <= ps_rdata;
+                                write_byte <= ps_byte;
                             end
                             default: begin end
                         endcase
 
                         if (ps_more) begin
                             op_index <= op_index + 3'd1;
+                            op_addr <= op_addr + 18'd1;
                         end else begin
                             case (op_kind)
                                 OP_WRITE_INPUT: begin

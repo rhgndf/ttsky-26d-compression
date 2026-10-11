@@ -21,5 +21,5 @@ dedicated outputs `uo[4:1]` mirror the four low status flags, with `uo[4]` as
 `error` and `uo[1]` as `in_ready`. Bytes beyond the first 16 SCK cycles are
 ignored until `CS_n` rises.
 
-`ui3` selects the PSRAM read-sampling edge: `0` samples with the SCK rising
+`ui3` selects the PSRAM read-sampling phase: `0` samples at the SCK rising
 edge, and `1` samples one design clock later. Set it while `rst_n` is low.

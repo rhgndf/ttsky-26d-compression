@@ -14,23 +14,26 @@ module tb #(
     wire [7:0] uio_in;
     wire [3:0] host_sd;
     wire [3:0] host_sd_oe;
-    wire [3:0] psram_sd_out;
-    wire [3:0] psram_sd_oe;
-    wire [31:0] psram_error_count;
+    wire [3:0] psram_sd_raw;
+    wire [3:0] psram_sd_delayed;
+    wire [3:0] psram_sd_bus;
 
     assign host_sd = {uio_out[5], uio_out[4], uio_out[2], uio_out[1]};
     assign host_sd_oe = {uio_oe[5], uio_oe[4], uio_oe[2], uio_oe[1]};
+    assign #(PSRAM_READ_DELAY_NS) psram_sd_delayed = psram_sd_raw;
+    assign psram_sd_bus = {
+        host_sd_oe[3] ? host_sd[3] : psram_sd_delayed[3],
+        host_sd_oe[2] ? host_sd[2] : psram_sd_delayed[2],
+        host_sd_oe[1] ? host_sd[1] : psram_sd_delayed[1],
+        host_sd_oe[0] ? host_sd[0] : psram_sd_delayed[0]
+    };
 
     assign uio_in[0] = 1'b0;
-    assign uio_in[1] = uio_oe[1] ? uio_out[1] :
-                       psram_sd_oe[0] ? psram_sd_out[0] : 1'bz;
-    assign uio_in[2] = uio_oe[2] ? uio_out[2] :
-                       psram_sd_oe[1] ? psram_sd_out[1] : 1'bz;
+    assign uio_in[1] = psram_sd_bus[0];
+    assign uio_in[2] = psram_sd_bus[1];
     assign uio_in[3] = 1'b0;
-    assign uio_in[4] = uio_oe[4] ? uio_out[4] :
-                       psram_sd_oe[2] ? psram_sd_out[2] : 1'bz;
-    assign uio_in[5] = uio_oe[5] ? uio_out[5] :
-                       psram_sd_oe[3] ? psram_sd_out[3] : 1'bz;
+    assign uio_in[4] = psram_sd_bus[2];
+    assign uio_in[5] = psram_sd_bus[3];
     assign uio_in[6] = 1'b0;
     assign uio_in[7] = 1'b0;
 
@@ -54,16 +57,12 @@ module tb #(
 `endif
     );
 
-    psram_model #(
-        .READ_DELAY_NS(PSRAM_READ_DELAY_NS)
-    ) psram_model (
-        .sck(uio_out[3]),
-        .cs_n(uio_out[6]),
-        .host_sd(host_sd),
-        .host_oe(host_sd_oe),
-        .dev_sd(psram_sd_out),
-        .dev_oe(psram_sd_oe),
-        .error_count(psram_error_count)
+    spiram psram_model (
+        .spi_clk(uio_out[3]),
+        .spi_ncs(uio_out[6]),
+        .spi_sin(psram_sd_bus),
+        .spi_sout(psram_sd_raw),
+        .spi_oe(|host_sd_oe)
     );
 
 `ifndef __pnr__

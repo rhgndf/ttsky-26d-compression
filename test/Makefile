@@ -8,6 +8,8 @@ TOPLEVEL_LANG ?= verilog
 SRC_DIR = $(PWD)/../src
 PROJECT_SOURCES = project.v spi_slave.v psram_qpi.v lz4_engine.v
 PSRAM_READ_DELAY_NS ?= 18
+PSRAM_RD_LATE ?= 1
+export PSRAM_RD_LATE
 
 ifneq ($(GATES),yes)
 
@@ -32,7 +34,8 @@ VERILOG_SOURCES += $(PWD)/gate_level_netlist.v
 
 endif
 
-VERILOG_SOURCES += $(PWD)/psram_model.v
+VERILOG_SOURCES += $(PWD)/ly68l6400_model.v
+COMPILE_ARGS += -g2012
 COMPILE_ARGS += -Ptb.PSRAM_READ_DELAY_NS=$(PSRAM_READ_DELAY_NS)
 
 # Allow sharing configuration between design and testbench via `include`:
